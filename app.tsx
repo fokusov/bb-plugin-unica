@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { definePluginApp, type PluginPendingInteractionProps } from "@get-bb/plugin-sdk/app";
+import { DiagnosticsSection } from "./components/diagnostics.js";
 
 function Confirm({ interaction, submit, cancel }: PluginPendingInteractionProps) {
   const [pending, setPending] = useState(false);
@@ -27,4 +28,5 @@ function Confirm({ interaction, submit, cancel }: PluginPendingInteractionProps)
 
 export default definePluginApp((app) => {
   app.slots.pendingInteraction({ id: "unica-confirm", component: Confirm });
+  app.slots.settingsSection({ id: "diagnostics", title: "Диагностика Unica", component: DiagnosticsSection });
 });

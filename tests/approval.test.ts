@@ -57,3 +57,32 @@ test("agent confirmation is scoped to the approved workspace and command", async
     policy: "ask", approved: true,
   });
 });
+
+test("read policy denies a write before it reaches the host executor", async (t) => {
+  let executions = 0;
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "bb-unica",
+    experimental_callHostRpc: ({ method }) => {
+      if (method === "policy") return "read";
+      if (method === "classify") return {
+        danger: true, destructive: false, tool: "unica.apply", op: "apply",
+        label: "Выполнение плана", effects: ["workspaceFiles"], detail: "", error: "",
+      };
+      if (method === "execute") { executions++; return { ok: true }; }
+      throw new Error(`Unexpected host method: ${method}`);
+    },
+  });
+  t.after(() => harness.lifecycle.dispose());
+  harness.sdk.stub("plugins.list", async () => ({ plugins: [] }));
+  harness.sdk.stub("threads.get", async () => ({ projectId: "p", environmentId: "e" }));
+  harness.sdk.stub("environments.get", async () => ({ id: "e", path: "/source/main", hostId: "h", projectId: "p",
+    status: "ready", lifecycle: { phase: "active" } }));
+  harness.sdk.stub("projects.get", async () => ({ id: "p", name: "test",
+    sources: [{ path: "/source/main", hostId: "h", isDefault: true }] }));
+  await plugin(bb);
+
+  const result = await harness.behavior.callAgentTool("unica_call",
+    { tool: "unica.apply", arguments: { executionToken: "fixture-plan" } }, { threadId: "t", projectId: "p" });
+  assert.match(JSON.stringify(result), /Политика read запрещает/);
+  assert.equal(executions, 0);
+});

@@ -2,13 +2,20 @@ import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import type { BbPluginApi, PluginAgentToolContext, PluginAgentToolResult } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { hostContract, operationSchema, unicaPolicySchema, type Operation } from "./contract.js";
+import {
+  hostContract, operationSchema, unicaCallResultSchema, unicaPolicySchema, unicaStatusSchema,
+  unicaToolsResultSchema, type Operation,
+} from "./contract.js";
+import { diagnosticsContract, type DiagnosticReport } from "./diagnostics.js";
 
 type Sdk = BbPluginApi["sdk"];
 type Selection = { projectId?: string; environmentId?: string; threadId?: string };
 const confirmationRenderer = "unica-confirm";
-const conflict = "Unica встроена в активный 1c-properties. Для перехода остановите встроенную интеграцию и перезагрузите bb-unica.";
+const conflict = "1c-properties не передал Unica. Выберите внешний режим, перезагрузите 1c-properties, затем bb-unica.";
+const reload = "Перезагрузите bb-unica после передачи Unica.";
+const ownershipSchema = z.object({ version: z.literal(1), mode: z.enum(["embedded", "external", "blocked"]) });
 const errorText = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
+const diagnosticError = (cause: unknown) => errorText(cause).slice(0, 1000);
 
 export async function resolveTarget(sdk: Sdk, selection: Selection) {
   const thread = selection.threadId ? await sdk.threads.get({ threadId: selection.threadId }) : undefined;
@@ -35,7 +42,16 @@ export async function resolveTarget(sdk: Sdk, selection: Selection) {
 
 export async function legacyOwnerActive(sdk: Sdk) {
   const { plugins } = await sdk.plugins.list();
-  return plugins.some((plugin) => plugin.id === "1c-properties" && plugin.enabled);
+  if (!plugins.some((plugin) => plugin.id === "1c-properties" && plugin.enabled)) return false;
+  try {
+    const state = await sdk.plugins.callRpc({
+      pluginId: "1c-properties", method: "unicaOwnership", input: {}, outputSchema: ownershipSchema,
+    });
+    return state.mode !== "external";
+  } catch {
+    // Older versions and unavailable handlers cannot certify that Unica was released.
+    return true;
+  }
 }
 
 const commonProperties = { projectId: { type: "string" } };
@@ -77,10 +93,84 @@ const usage = [
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
   const ownsTools = !(await legacyOwnerActive(bb.sdk));
+  const ownershipIssue = async () => await legacyOwnerActive(bb.sdk) ? conflict : ownsTools ? null : reload;
   const ownership = async () => {
-    if (await legacyOwnerActive(bb.sdk)) throw new Error(conflict);
-    if (!ownsTools) throw new Error("Перезагрузите bb-unica после отключения встроенной Unica.");
+    const issue = await ownershipIssue();
+    if (issue) throw new Error(issue);
   };
+
+  bb.rpc.register(diagnosticsContract, {
+    async diagnosticProjects(_, { experimental_signal: signal }) {
+      const [issue, projects] = await Promise.all([
+        ownershipIssue(),
+        bb.sdk.projects.list({ signal }),
+      ]);
+      return {
+        issue,
+        agentTools: issue ? [] : tools.map(({ name, description }) => ({ name, description })),
+        projects: projects.filter(({ kind, sources }) => kind === "standard" && sources.length > 0)
+          .map(({ id, name }) => ({ id, name })),
+      };
+    },
+    async diagnosticEnvironments({ projectId }, { experimental_signal: signal }) {
+      const environments = await bb.sdk.environments.list({ projectId, status: "ready", signal });
+      return environments.flatMap(({ id, name, path, branchName, lifecycle }) =>
+        path && lifecycle.phase === "active" ? [{ id, name: branchName || name || id, path }] : []);
+    },
+    async diagnose({ probe, ...selection }, { experimental_signal: signal }) {
+      await ownership();
+      const { path, hostId } = await resolveTarget(bb.sdk, selection);
+      const executeRead = (operation: Operation) => host.call("execute", {
+        path, operation, policy: "read", approved: false,
+      }, { hostId, signal, timeoutMs: 60_000 });
+      let { runtime, running, initialized } = unicaStatusSchema.parse(await executeRead({ kind: "status" }));
+      let catalog: DiagnosticReport["catalog"] = null;
+      let source: DiagnosticReport["source"] = null;
+      if (probe && runtime.status === "ready") {
+        try {
+          const inventory = unicaToolsResultSchema.parse(await executeRead({ kind: "tools" }));
+          catalog = inventory.ok
+            ? { ok: true, tools: inventory.tools.map(({ name, description, access }) => ({
+              name, description: description.slice(0, 1200), access,
+            })) }
+            : { ok: false, error: diagnosticError(inventory.error || "MCP не вернул каталог.") };
+        } catch (cause) {
+          catalog = { ok: false, error: diagnosticError(cause) };
+        }
+        if (catalog.ok) {
+          try {
+            if (!catalog.tools.some(({ name }) => name === "unica.view")) {
+              throw new Error("В каталоге отсутствует unica.view.");
+            }
+            const check = unicaCallResultSchema.parse(await executeRead({
+              kind: "call", tool: "unica.view", arguments: {}, waitMs: 0,
+            }));
+            if (!check.ok) throw new Error(check.error || "unica.view не смог прочитать исходники.");
+            let response: unknown;
+            try { response = JSON.parse(check.text); }
+            catch { throw new Error("unica.view вернул ответ в неизвестном формате."); }
+            const reply = z.object({ data: z.object({
+              workspaceRoot: z.string().min(1),
+              effectiveSourceRoot: z.string().nullish(),
+              sourceSets: z.array(z.unknown()).optional(),
+            }) }).safeParse(response);
+            if (!reply.success) throw new Error("unica.view не сообщил рабочий каталог.");
+            if (!reply.data.data.effectiveSourceRoot) {
+              throw new Error(reply.data.data.sourceSets?.length
+                ? "MCP ответил. Unica не смогла выбрать набор исходников."
+                : "MCP ответил. Исходники 1С в выбранном каталоге не обнаружены.");
+            }
+            source = { ok: true, workspaceRoot: reply.data.data.workspaceRoot };
+          } catch (cause) {
+            source = { ok: false, error: diagnosticError(cause) };
+          }
+        }
+        ({ runtime, running, initialized } = unicaStatusSchema.parse(await executeRead({ kind: "status" })));
+      }
+      return { path, runtime: { status: runtime.status, packageVersion: runtime.packageVersion, error: diagnosticError(runtime.error) }, running, initialized,
+        catalog, source, checkedAt: Date.now() };
+    },
+  });
 
   async function dispatch(operation: Operation, selection: Selection, signal?: AbortSignal, terminalApproval = false, interaction?: { detached: boolean }) {
     await ownership();
@@ -172,7 +262,12 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: values.project ?? (values.environment ? undefined : context.projectId),
           environmentId: values.environment, threadId: context.threadId,
         };
-        if (command === "status" && !ownsTools) return { stdout: JSON.stringify({ active: false, message: conflict }), exitCode: 0 };
+        if (command === "status") {
+          const issue = await ownershipIssue();
+          if (issue) {
+            return { stdout: JSON.stringify({ active: false, message: issue }), exitCode: 0 };
+          }
+        }
         if (command === "skills" && context.threadId) throw new Error("Подключите навыки из терминала пользователя вне треда");
         if (command === "policy") {
           await ownership();

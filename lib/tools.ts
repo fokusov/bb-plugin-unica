@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -109,6 +109,31 @@ export function unicaRuntimeExecutable(dataDir: string) {
   return local && !local.startsWith("..") && existsSync(executable) ? executable : "";
 }
 
+async function prefetchRuntime(launch: ReturnType<typeof unicaLaunchInfo>, signal: AbortSignal) {
+  const deadline = AbortSignal.any([signal, AbortSignal.timeout(840_000)]);
+  deadline.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(launch.bootstrap, ["prefetch", "--plugin-root", launch.root], {
+      signal: deadline,
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, UNICA_RUNTIME_CACHE_DIR: launch.runtimeCache, UNICA_PROVIDER_STATE_DIR: launch.providerState },
+    });
+    // Bootstrap writes download progress to stderr. Retain only the tail for diagnosis.
+    let tail = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { tail = (tail + chunk).slice(-8192); });
+    let failure: Error | undefined;
+    child.once("error", (cause) => { failure = cause; });
+    child.once("close", (code, killSignal) => {
+      if (deadline.aborted) reject(deadline.reason);
+      else if (failure) reject(failure);
+      else if (code === 0) resolve();
+      else reject(new Error(`Bootstrap Unica завершился (${code ?? killSignal}): ${tail.trim()}`));
+    });
+  });
+}
+
 const preparations = new Map<string, Promise<UnicaRuntimeState>>();
 export async function prepareRuntime(dataDir: string, signal: AbortSignal) {
   const running = preparations.get(dataDir);
@@ -131,10 +156,7 @@ export async function prepareRuntime(dataDir: string, signal: AbortSignal) {
     }
     const launch = unicaLaunchInfo(dataDir);
     if (unicaRuntimeStatus(dataDir).status !== "ready") {
-      await exec(launch.bootstrap, ["prefetch", "--plugin-root", launch.root], {
-        signal, windowsHide: true, timeout: 840_000, maxBuffer: 2 * 1024 * 1024,
-        env: { ...process.env, UNICA_RUNTIME_CACHE_DIR: launch.runtimeCache, UNICA_PROVIDER_STATE_DIR: launch.providerState },
-      });
+      await prefetchRuntime(launch, signal);
     }
     const status = unicaRuntimeStatus(dataDir);
     if (status.status !== "ready") throw new Error("Bootstrap не подготовил все артефакты Unica для этого хоста");

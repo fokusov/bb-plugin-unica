@@ -25,6 +25,7 @@
     "app.tsx",
     "host.ts",
     "contract.ts",
+    "components",
     "lib",
     "tests",
     "scripts"
